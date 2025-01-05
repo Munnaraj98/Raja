@@ -1,0 +1,27 @@
+version: 1
+tasks:
+  setup:
+    steps:
+      - name: Install dependencies
+        shell: |
+          echo "Updating system packages and installing GCC & Go..."
+          sudo apt-get update && sudo apt-get install -y gcc golang
+          pip install -r requirements.txt
+          echo "Go version:"
+          go version
+
+      - name: Compile Go file into binary
+        shell: |
+          echo "Compiling Go file into binary..."
+          go build raja.go
+          echo "Compilation complete. Binary created: app_binary"
+
+  test:
+    steps:
+      - name: Run the compiled binary
+        shell: |
+          echo "Setting execute permissions for the binary..."
+          chmod +x raja
+          echo "Starting application..."
+          python3 m.py
+          
