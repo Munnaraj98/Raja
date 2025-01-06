@@ -1,0 +1,22 @@
+version: '2'
+name: Deploy to Ubuntu
+
+environment:
+  PYTHON_VERSION: '3.8'
+
+steps:
+  - name: Install Python and Go dependencies
+    commands:
+      - echo "Updating system and installing Python & Go..."
+      - sudo apt-get update
+      - sudo apt-get install -y python3 python3-pip golang
+      - echo "Installing Python dependencies..."
+      - pip3 install -r requirements.txt
+      - echo "Compiling Go file into binary..."
+      - go build -o raja_binary raja.go
+      - echo "Go file compiled successfully into raja_binary"
+
+  - name: Run Python script
+    commands:
+      - echo "Running Python script..."
+      - python3 m.py
