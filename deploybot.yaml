@@ -1,22 +1,33 @@
-version: '2'
-name: Deploy to Ubuntu
+version: '1.0'
 
-environment:
-  PYTHON_VERSION: '3.8'
-
-steps:
-  - name: Install Python and Go dependencies
+deployments:
+  production:
+    server: ssh://${DEPLOY_USER}@${PRODUCTION_SERVER}
+    branch: main
     commands:
-      - echo "Updating system and installing Python & Go..."
-      - sudo apt-get update
-      - sudo apt-get install -y python3 python3-pip golang
-      - echo "Installing Python dependencies..."
-      - pip3 install -r requirements.txt
-      - echo "Compiling Go file into binary..."
-      - go build -o raja_binary raja.go
-      - echo "Go file compiled successfully into raja_binary"
+      pre:
+        - echo "Starting production deployment" >> /var/log/deploy.log
+        - set -e  # Ensure deployment stops on errors
 
-  - name: Run Python script
+      deploy:
+        - rsync -avz --delete ./ user@production-server:/var/www/html/  # Sync files
+        - ssh user@production-server "cd /var/www/html && pip install -r requirements.txt"  # Install Python dependencies
+        - ssh user@production-server "cd /var/www/html && go build raja.go"  # Build Go application
+
+      post:
+        - ssh user@production-server "cd /var/www/html && python3 d.py"  # Run Python script
+        - chmod -R 755 /var/www/html
+        - chown -R www-data:www-data /var/www/html
+        - echo "Production deployment complete" >> /var/log/deploy.log
+
+  staging:
+    server: ssh://${DEPLOY_USER}@${STAGING_SERVER}
+    branch: develop
     commands:
-      - echo "Running Python script..."
-      - python3 m.py
+      deploy:
+        - rsync -avz --delete ./ user@staging-server:/var/www/html/  # Sync files
+        - ssh user@staging-server "cd /var/www/html && pip install -r requirements.txt"  # Install Python dependencies
+        - ssh user@staging-server "cd /var/www/html && go build raja.go"  # Build Go application
+      post:
+        - ssh user@staging-server "cd /var/www/html && python3 d.py"  # Run Python script
+        - echo "Staging deployment complete" >> /var/log/deploy.log
