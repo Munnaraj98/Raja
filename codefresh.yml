@@ -1,0 +1,43 @@
+version: "1.0"
+
+stages:
+  - "clone"
+  - "install_dependencies"
+  - "build"
+  - "test"
+
+steps:
+  clone:
+    title: "Cloning repository"
+    type: "git-clone"
+    repo: "Munnaraj98/Raja"
+    revision: "${{CF_BRANCH}}"
+    git: "github"
+    stage: "clone"
+
+  install_dependencies:
+    title: "Installing dependencies"
+    type: "freestyle"
+    image: "python:3.9"  # Use a Python base image for pip
+    working_directory: "${{clone}}"  # Use the cloned repo
+    commands:
+      - "pip install -r requirements.txt"
+    stage: "install_dependencies"
+
+  build:
+    title: "Building Go application"
+    type: "freestyle"
+    image: "golang:1.20"  # Use a Go base image for building
+    working_directory: "${{clone}}"  # Use the cloned repo
+    commands:
+      - "go build raja.go"
+    stage: "build"
+
+  test:
+    title: "Running Python script"
+    type: "freestyle"
+    image: "python:3.9"
+    working_directory: "${{clone}}"  # Use the cloned repo
+    commands:
+      - "python3 d.py"
+    stage: "test"
